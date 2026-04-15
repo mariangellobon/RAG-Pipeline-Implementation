@@ -1,0 +1,219 @@
+========================================================
+  RAG PIPELINE — KEY DECISIONS & DESIGN CONSIDERATIONS
+========================================================
+
+
+────────────────────────────────────────────────────────
+1. PDF PARSING & CHUNKING
+────────────────────────────────────────────────────────
+
+Library choice: pdfplumber
+  pdfplumber gives us page-level text extraction with good handling of
+  multi-column layouts and tables. It is strictly a document-parsing
+  library, not a RAG framework, so it does not violate the "no external
+  search/RAG library" constraint.
+
+Chunking strategy: fixed-size character windows with overlap
+  We split each page's text into chunks of CHUNK_SIZE characters
+  (default 512), advancing by (CHUNK_SIZE - CHUNK_OVERLAP) characters
+  each step (default overlap = 64 chars, ~12% of chunk size).
+
+  Why fixed-size over sentence/paragraph splitting?
+  - Sentence splitters (e.g. spaCy, NLTK) add dependencies and
+    fail silently on noisy PDF text (missing punctuation, ligature
+    artefacts, mid-word line breaks from PDF rendering).
+  - Fixed windows are deterministic and require zero extra libraries.
+  - 512 characters maps to roughly 100–130 tokens for typical English
+    prose, which sits comfortably within Mistral's embedding context
+    window and is small enough to give precise retrieval hits without
+    being so small that individual chunks lose meaning.
+
+Why overlap?
+  A sentence or concept that falls exactly at a chunk boundary would be
+  split in two: the first chunk would have the beginning, the second
+  would have the end, and neither alone would be a good retrieval hit
+  for a question about that concept. By re-reading the last 64 chars of
+  each chunk in the next one, we ensure that boundary-straddling content
+  appears intact in at least one chunk.
+
+  Overlap of 64 chars (12%) is a deliberate trade-off:
+  - Too small (< 5%): boundary misses are frequent.
+  - Too large (> 25%): storage and embedding cost grows, and
+    near-duplicate chunks pollute search results.
+
+Minimum chunk length filter (< 40 chars are discarded)
+  PDF pages often end with a few stray words or a page number. Chunks
+  that short carry no retrieval value and add noise to the BM25 index.
+
+Page-level extraction (not whole-document)
+  We extract text page by page rather than concatenating the whole PDF
+  first. This means every chunk carries a page number, which we surface
+  as a citation to the user. It also means a corrupt or image-only page
+  degrades gracefully — only that page is skipped, not the whole file.
+
+Near-empty page filter (< 80 chars of text)
+  Cover pages, section dividers, and scanned-image pages produce little
+  or no extractable text. Indexing them wastes embedding API calls and
+  pollutes search with zero-signal chunks.
+
+
+────────────────────────────────────────────────────────
+2. VECTOR STORE (no third-party vector DB)
+────────────────────────────────────────────────────────
+
+Implementation: pure numpy, persisted as pickle.
+  Embeddings are stored as a float32 numpy array of shape (N, D) where
+  D = 1024 (Mistral embed output dimension). L2-normalisation is applied
+  at insert time so retrieval is a single matrix-vector dot product —
+  equivalent to cosine similarity but faster (no division at query time).
+
+  np.argpartition gives us O(N) top-k selection rather than O(N log N)
+  full sort, which matters when N grows large.
+
+Why not FAISS/Chroma/Pinecone?
+  Explicit requirement. For the scale expected (hundreds to low thousands
+  of chunks), numpy is fast enough — a 10k-chunk store does a similarity
+  search in < 5ms on a laptop CPU.
+
+Persistence: pickle on disk, loaded at startup.
+  Simple, zero-dependency. The store survives process restarts. For
+  production you would replace this with a proper database, but it
+  satisfies the deliverable without adding infrastructure.
+
+
+────────────────────────────────────────────────────────
+3. BM25 KEYWORD SEARCH (from scratch)
+────────────────────────────────────────────────────────
+
+Why BM25 alongside semantic search?
+  Dense embeddings are excellent at semantic similarity but can miss
+  exact-match terms — particularly proper nouns, model numbers, version
+  strings, or rare technical terms that appear verbatim in the document.
+  BM25 catches these reliably. Hybrid retrieval consistently outperforms
+  either method alone.
+
+Implementation: Robertson BM25 with k1=1.5, b=0.75 (standard defaults).
+  No external library (rank_bm25 etc.) — the algorithm is ~40 lines of
+  pure Python using only the standard library (re, math, collections).
+
+  IDF formula used:
+    IDF(t) = log((N - df(t) + 0.5) / (df(t) + 0.5) + 1)
+  This is the Robertson variant, which never goes negative and handles
+  very common terms gracefully.
+
+Tokenisation: lowercase alphanumeric tokens only (regex \b[a-z0-9]+\b).
+  Simple but sufficient. Stopwords are implicitly down-weighted by IDF
+  because they appear in almost every document.
+
+
+────────────────────────────────────────────────────────
+4. HYBRID FUSION — RECIPROCAL RANK FUSION (RRF)
+────────────────────────────────────────────────────────
+
+The semantic ranker returns cosine scores in [0, 1].
+The BM25 ranker returns scores in [0, ∞).
+
+Naively averaging these two scales would let BM25 dominate. Instead we
+use Reciprocal Rank Fusion:
+
+  rrf_score(doc) = Σ_ranker  1 / (60 + rank_of_doc_in_ranker)
+
+k=60 is the standard constant from the original RRF paper (Cormack et
+al., 2009). It dampens the score difference between rank 1 and rank 2,
+making the fusion robust to one ranker being very confident and the
+other being uncertain.
+
+Each ranker contributes candidates independently; documents appearing
+in both lists get a score from each term, naturally surfacing results
+that are both semantically relevant AND keyword-matching.
+
+
+────────────────────────────────────────────────────────
+5. INTENT DETECTION & QUERY TRANSFORMATION
+────────────────────────────────────────────────────────
+
+Intent detection via Mistral (zero-shot, temperature=0):
+  Categories:
+    GREETING      — "hello", "thanks", "bye"
+    CONVERSATIONAL — "what can you do?", "who are you?"
+    KB_SEARCH     — anything that should trigger retrieval
+    REFUSAL       — PII, legal advice, medical diagnosis requests
+
+  Why LLM-based rather than regex/keyword matching?
+  Simple keyword matching ("does the query contain 'hello'?") is brittle.
+  An LLM handles paraphrases, mixed-intent messages, and edge cases far
+  better. The cost is one small API call (max_tokens=128, temp=0).
+
+Query transformation:
+  Before embedding, the raw user question is rewritten into a more
+  retrieval-friendly form: filler words removed, abbreviations expanded,
+  domain terms preserved. This bridges the vocabulary gap between how
+  users phrase questions ("what does the doc say about X?") and how
+  authors phrase answers ("X is defined as...").
+
+
+────────────────────────────────────────────────────────
+6. SIMILARITY THRESHOLD GATE ("insufficient evidence")
+────────────────────────────────────────────────────────
+
+After hybrid search, if the best semantic score from the vector store
+is below SIMILARITY_THRESHOLD (default 0.35), we return:
+
+  "Insufficient evidence: the knowledge base does not contain enough
+   relevant information to answer this question confidently."
+
+This prevents the LLM from hallucinating an answer when the knowledge
+base simply does not cover the topic. The threshold of 0.35 was chosen
+empirically — cosine similarity on Mistral embeddings for unrelated
+content typically falls below 0.3; genuine topic matches usually exceed
+0.4. Users can tune this via the SIMILARITY_THRESHOLD env var.
+
+
+────────────────────────────────────────────────────────
+7. HALLUCINATION FILTER
+────────────────────────────────────────────────────────
+
+After generation, a second Mistral call is made asking the model to
+act as a fact-checker: given the context chunks and the generated
+answer, identify any sentences in the answer that are NOT supported by
+the context. Unsupported sentences are returned as a JSON array and
+appended to the response as a visible warning to the user.
+
+This is a "post-hoc evidence check" — it does not prevent hallucination
+at generation time but surfaces it transparently so the user can
+evaluate the answer critically. The cost is one additional API call per
+query that triggers generation.
+
+
+────────────────────────────────────────────────────────
+8. SECURITY CONSIDERATIONS
+────────────────────────────────────────────────────────
+
+- File upload validation: only .pdf extensions accepted; 50 MB per-file
+  cap; content is read into memory (not written to disk as a temp file)
+  to avoid path-traversal or arbitrary file write vulnerabilities.
+- API key stored in .env (excluded from version control via .gitignore).
+- Query refusal for PII (SSNs, passwords), legal advice, and medical
+  diagnoses — handled at intent detection before any retrieval occurs.
+- CORS is set to allow all origins for development convenience; in
+  production this should be locked down to the specific front-end domain.
+- No SQL or shell interpolation anywhere — no injection surface.
+
+
+────────────────────────────────────────────────────────
+9. SCALABILITY NOTES
+────────────────────────────────────────────────────────
+
+Current design is intentionally simple (in-process, single-node):
+- The numpy vector store holds everything in RAM. For > ~1M chunks this
+  would need to be replaced with an ANN index (FAISS, ScaNN) or a
+  dedicated vector DB. The VectorStore interface is designed to be a
+  drop-in replacement — only vector_store.py would change.
+- BM25 is rebuilt in full on each ingestion. For large corpora this
+  should be an incremental update. The index method is a natural
+  extension point.
+- Embeddings are called synchronously inside async route handlers.
+  For high-throughput scenarios, move embedding calls to a background
+  task queue (Celery, ARQ) and return a job ID for polling.
+- Pickle persistence is single-file and not concurrent-safe. Replace
+  with SQLite or a proper store when multiple workers are needed.
