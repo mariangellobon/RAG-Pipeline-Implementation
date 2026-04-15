@@ -1,209 +1,309 @@
-# RAG Pipeline (FastAPI + Mistral)
+# RAG Pipeline — FastAPI + Mistral AI
 
-A simple PDF-based Retrieval-Augmented Generation (RAG) system built for the StackAI take-home technical exercise.
+A Python backend for a Retrieval-Augmented Generation (RAG) system over PDF files.  
+Users upload documents, ask questions in natural language, and receive grounded answers with source citations.
 
-The system lets users upload PDF files, indexes them for retrieval, and answers questions with grounded responses and citations.
+Built without any external RAG framework or third-party vector database — all retrieval logic is implemented from scratch.
 
-## Features
+---
 
-- FastAPI backend with two required endpoints:
-  - `POST /api/ingest` for PDF ingestion
-  - `POST /api/query` for question answering
-- PDF parsing and chunking with configurable chunk size/overlap
-- Query intent detection and query transformation
-- Hybrid retrieval:
-  - Semantic search (Mistral embeddings + cosine similarity)
-  - Keyword search (custom BM25 implementation)
-  - Reciprocal Rank Fusion (RRF) for re-ranking
-- "Insufficient evidence" threshold gate
-- Chat UI for file upload + Q&A
-- Citation metadata in query responses
-- No third-party vector database
-- No external RAG orchestration framework
+## System Design
 
-## Architecture
+### High-Level Architecture
 
-1. Upload PDFs via `POST /api/ingest`
-2. Extract and clean text page-by-page
-3. Chunk text into overlapping windows
-4. Generate embeddings with Mistral
-5. Store chunks + vectors in an in-memory numpy vector store (persisted to disk)
-6. Build BM25 index over all chunks
-7. Query flow (`POST /api/query`):
-   - Detect intent
-   - Transform user query for retrieval
-   - Embed transformed query
-   - Run hybrid retrieval (semantic + BM25)
-   - Fuse/re-rank with RRF
-   - Apply similarity threshold gate
-   - Generate answer with Mistral from retrieved context
-   - Return answer + citations
+Both endpoints use `POST` because both receive data from the client in the request body —
+`/api/ingest` receives PDF files, `/api/query` receives a JSON payload `{ "query": "..." }`.
+`POST` means "send data to be processed", which applies to both.
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                           CLIENT (Browser UI)                        │
+└──────────────┬───────────────────────────────────┬───────────────────┘
+               │                                   │
+    POST /api/ingest                      POST /api/query
+    (send PDF files)                      (send JSON query)
+               │                                   │
+┌──────────────▼───────────────────────────────────▼───────────────────┐
+│                            FastAPI Backend                           │
+│                                                                      │
+│  ┌─────────────────────┐           ┌──────────────────────────────┐  │
+│  │  Ingestion Pipeline │           │       Query Pipeline          │  │
+│  │                     │           │                              │  │
+│  │  Extract → Chunk    │  [1] WRITE│  Intent Detection            │  │
+│  │          ↓          │ ─────────►│       ↓                      │  │
+│  │  [1] Embed chunks   │           │  Transform query             │  │
+│  │  (Mistral embed)    │           │       ↓                      │  │
+│  │          ↓          │           │  [2] Embed query             │  │
+│  │   Store vectors     │           │  (Mistral embed)             │  │
+│  │   + BM25 index      │           │       ↓                      │  │
+│  └─────────────────────┘           │  [3] READ from Storage       │  │
+│                                    │  Semantic + BM25 search      │  │
+│  ┌─────────────────────┐  [3] READ │       ↓                      │  │
+│  │    Storage Layer     │◄─────────│  RRF Re-rank                 │  │
+│  │                      │          │       ↓                      │  │
+│  │  VectorStore (numpy) │          │  Threshold Gate              │  │
+│  │  BM25 Index          │          │       ↓                      │  │
+│  │  Pickle on disk      │          │  [4] Generate answer         │  │
+│  └─────────────────────┘          │  (Mistral chat)              │  │
+│                                    │       ↓                      │  │
+│                                    │  Hallucination check         │  │
+│                                    └──────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────┘
+
+Mistral AI API is called at 4 numbered points above:
+  [1] Ingestion  — embed each text chunk (mistral-embed)
+  [2] Querying   — embed the user's query (mistral-embed)
+  [3]            — Storage is READ here (no Mistral call, pure numpy/BM25)
+  [4] Querying   — generate the final answer (mistral-small-latest)
+```
+
+---
+
+### Ingestion Pipeline
+
+```
+PDF File(s)
+    │
+    ▼
+┌───────────────┐
+│  pdfplumber   │  ← page-by-page text extraction
+└───────┬───────┘
+        │
+        ▼
+┌───────────────┐
+│   Chunker     │  ← fixed-size windows, 512 chars, 64-char overlap
+└───────┬───────┘
+        │  list of Chunk(text, source, page, index)
+        ▼
+┌───────────────┐
+│Mistral Embed  │  ← batch calls to mistral-embed, 64 chunks/batch
+└───────┬───────┘
+        │  float32 vectors, shape (N, 1024)
+        ▼
+┌──────────────────────────────┐
+│  VectorStore   │  BM25 Index │  ← both updated, store persisted to disk
+└──────────────────────────────┘
+```
+
+---
+
+### Query Pipeline
+
+```
+User Query
+    │
+    ▼
+┌──────────────────────┐
+│   Intent Detection   │  ← Mistral LLM call (temp=0)
+└──────────┬───────────┘
+           │
+    ┌──────┴───────────────────────────────────┐
+    │              Intent routing              │
+    │                                          │
+  GREETING /           REFUSAL            KB_SEARCH
+  CONVERSATIONAL          │                   │
+    │                     ▼                   ▼
+    │              Return policy        Query Transform
+    │              message              (rewrite for retrieval)
+    │                                        │
+    ▼                                        ▼
+Direct LLM                          Embed transformed query
+response                                    │
+    │                          ┌────────────┼────────────┐
+    │                          ▼                         ▼
+    │                  Semantic Search             BM25 Search
+    │                  (cosine similarity)         (keyword match)
+    │                          │                         │
+    │                          └────────────┬────────────┘
+    │                                       ▼
+    │                              RRF Fusion & Re-rank
+    │                                       │
+    │                              Similarity Threshold
+    │                               (score ≥ 0.35?)
+    │                              /                \
+    │                            YES                NO
+    │                             │                  │
+    │                             ▼                  ▼
+    │                       LLM Generation    "Insufficient
+    │                             │             evidence"
+    │                             ▼
+    │                    Hallucination Check
+    │                             │
+    └─────────────────────────────┤
+                                  ▼
+                       Response + Citations
+```
+
+---
+
+## How It Operates
+
+### 1. Data Ingestion (`POST /api/ingest`)
+
+PDFs are extracted page by page using `pdfplumber`. Each page's text is split into fixed-size overlapping character windows (default: 512 chars, 64-char overlap). Each chunk carries its source filename and page number for citation purposes.
+
+Chunks are embedded in batches using Mistral's `mistral-embed` model, producing 1024-dimensional vectors. These are L2-normalised and stored in a numpy array alongside the original chunk objects. A BM25 index is rebuilt over all chunks to support keyword retrieval. The store is pickled to disk so it survives restarts.
+
+**Chunking design rationale:** See `DECISIONS.txt` § 1 for full reasoning on window size, overlap percentage, and the filtering of near-empty pages.
+
+### 2. Query Processing (`POST /api/query`)
+
+Every query goes through four stages before an answer is generated:
+
+**Intent detection** — A Mistral LLM call (zero-shot, temperature=0) classifies the query into one of four intents:
+
+| Intent | Behaviour |
+|---|---|
+| `GREETING` | Answered conversationally, no retrieval |
+| `CONVERSATIONAL` | Answered conversationally, no retrieval |
+| `KB_SEARCH` | Full retrieval pipeline triggered |
+| `REFUSAL` | Query declined (PII, legal/medical content) |
+
+**Query transformation** — For `KB_SEARCH` queries, a second LLM call rewrites the user's question into a retrieval-optimised form: filler words removed, abbreviations expanded, domain terms preserved. This bridges the vocabulary gap between how users ask questions and how documents are written.
+
+**Hybrid retrieval** — Two independent rankers run over the same corpus:
+- *Semantic search*: cosine similarity between the query embedding and all stored vectors (pure numpy, O(N) with `argpartition`)
+- *Keyword search*: BM25 scoring using a from-scratch implementation (Robertson IDF, k₁=1.5, b=0.75)
+
+Results are fused using **Reciprocal Rank Fusion (RRF)**:
+
+```
+rrf_score(doc) = Σ  1 / (60 + rank_in_ranker)
+```
+
+RRF is rank-based, so it avoids the scale mismatch between cosine scores (bounded 0–1) and BM25 scores (unbounded). Documents appearing in both result lists are naturally promoted.
+
+**Similarity threshold gate** — If the best semantic score from the vector store falls below `SIMILARITY_THRESHOLD` (default 0.35), the system returns `"Insufficient evidence"` rather than allowing the LLM to speculate.
+
+### 3. Answer Generation
+
+Retrieved chunks are assembled into a context block with source labels. A Mistral chat completion call produces a factual answer with inline citations (`[Source: filename, p.N]`).
+
+A second post-hoc LLM call acts as a hallucination filter: it checks each sentence in the answer against the context chunks and surfaces any claims not supported by the retrieved evidence.
+
+---
 
 ## Project Structure
 
-```text
-app/
-  api/
-    ingest.py
-    query.py
-  core/
-    pdf_parser.py
-    vector_store.py
-    bm25.py
-    retriever.py
-    intent.py
-    generator.py
-    config.py
-  models/
-    schemas.py
-  main.py
-  state.py
-ui/
-  index.html
-DECISIONS.txt
-PART3_REQUIREMENTS_GUIDE.md
+```
+rag-pipeline/
+├── app/
+│   ├── main.py               FastAPI app, lifespan (load/save store), health endpoint
+│   ├── state.py              Shared singletons: VectorStore + BM25
+│   ├── api/
+│   │   ├── ingest.py         POST /api/ingest
+│   │   └── query.py          POST /api/query
+│   ├── core/
+│   │   ├── pdf_parser.py     pdfplumber extraction + overlapping chunker
+│   │   ├── vector_store.py   numpy vector store, cosine similarity, pickle persistence
+│   │   ├── bm25.py           BM25 from scratch (no rank_bm25)
+│   │   ├── retriever.py      Hybrid search + RRF fusion
+│   │   ├── intent.py         Intent detection + query transformation
+│   │   ├── generator.py      LLM answer generation + hallucination filter
+│   │   ├── embeddings.py     Mistral embed wrapper
+│   │   └── config.py         Settings from .env (Pydantic)
+│   └── models/
+│       └── schemas.py        Pydantic request/response models
+├── ui/
+│   └── index.html            Chat UI (file upload + Q&A)
+├── DECISIONS.txt             Full design rationale and chunking considerations
+├── .env.example
+└── requirements.txt
 ```
 
-## API
+---
 
-### `POST /api/ingest`
+## How to Run
 
-Upload one or more PDF files using multipart form data key: `files`.
-
-Example:
-
-```bash
-curl -X POST http://localhost:8000/api/ingest \
-  -F "files=@/path/to/file1.pdf" \
-  -F "files=@/path/to/file2.pdf"
-```
-
-Response:
-
-```json
-{
-  "message": "Ingestion complete.",
-  "files_processed": 2,
-  "chunks_created": 145,
-  "filenames": ["file1.pdf", "file2.pdf"]
-}
-```
-
-### `POST /api/query`
-
-Ask a question over the ingested knowledge base.
-
-```bash
-curl -X POST http://localhost:8000/api/query \
-  -H "Content-Type: application/json" \
-  -d '{"query":"What are the key risks?", "top_k":5}'
-```
-
-Response shape:
-
-```json
-{
-  "answer": "...",
-  "intent": "KB_SEARCH",
-  "citations": [
-    {
-      "source": "file1.pdf",
-      "page": 12,
-      "chunk_index": 44,
-      "score": 0.61,
-      "text_snippet": "..."
-    }
-  ],
-  "search_triggered": true,
-  "query_used": "key risks discussed in the report"
-}
-```
-
-### `GET /health`
-
-Returns service and index health:
-
-```json
-{
-  "status": "ok",
-  "chunks_in_store": 145,
-  "files_ingested": ["file1.pdf", "file2.pdf"]
-}
-```
-
-## Setup
-
-### 1) Create environment
+### 1. Install dependencies
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 2) Configure environment variables
-
-Copy `.env.example` to `.env` and set values:
+### 2. Configure environment
 
 ```bash
 cp .env.example .env
+# Set MISTRAL_API_KEY in .env
 ```
 
-Required:
+Key variables:
 
-- `MISTRAL_API_KEY`
+| Variable | Default | Description |
+|---|---|---|
+| `MISTRAL_API_KEY` | — | Required |
+| `MISTRAL_EMBED_MODEL` | `mistral-embed` | Embedding model |
+| `MISTRAL_CHAT_MODEL` | `mistral-small-latest` | Chat model |
+| `CHUNK_SIZE` | `512` | Characters per chunk |
+| `CHUNK_OVERLAP` | `64` | Overlap between chunks |
+| `SIMILARITY_THRESHOLD` | `0.35` | Minimum score to trigger generation |
+| `TOP_K` | `5` | Chunks returned per query |
 
-Common optional tuning:
-
-- `MISTRAL_EMBED_MODEL` (default `mistral-embed`)
-- `MISTRAL_CHAT_MODEL` (default `mistral-small-latest`)
-- `TOP_K` (default `5`)
-- `SIMILARITY_THRESHOLD` (default `0.35`)
-- `CHUNK_SIZE` (default `512`)
-- `CHUNK_OVERLAP` (default `64`)
-- `VECTOR_STORE_PATH` (default `data/vector_store.pkl`)
-
-### 3) Run
+### 3. Start the server
 
 ```bash
 uvicorn app.main:app --reload
 ```
 
-Open:
+| URL | Description |
+|---|---|
+| `http://localhost:8000/` | Chat UI |
+| `http://localhost:8000/docs` | Interactive API docs (Swagger) |
+| `http://localhost:8000/health` | Store status |
 
-- App UI: <http://localhost:8000/>
-- API docs: <http://localhost:8000/docs>
+---
 
-## Design Notes
+## API Reference
 
-- Chunking and retrieval considerations are documented in `DECISIONS.txt`.
-- A full Part 3 requirement walkthrough is in `PART3_REQUIREMENTS_GUIDE.md`.
+### `POST /api/ingest`
+Upload one or more PDF files. Accepts `multipart/form-data` with field name `files`.
 
-## Libraries and Software Used
+**Response:**
+```json
+{
+  "message": "Ingestion complete.",
+  "files_processed": 2,
+  "chunks_created": 145,
+  "filenames": ["report.pdf", "financials.pdf"]
+}
+```
 
-- FastAPI: <https://fastapi.tiangolo.com/>
-- Uvicorn: <https://www.uvicorn.org/>
-- Mistral AI API and SDK:
-  - <https://docs.mistral.ai/>
-  - <https://github.com/mistralai/client-python>
-- pdfplumber: <https://github.com/jsvine/pdfplumber>
-- NumPy: <https://numpy.org/>
-- Pydantic / pydantic-settings:
-  - <https://docs.pydantic.dev/>
-  - <https://docs.pydantic.dev/latest/concepts/pydantic_settings/>
+### `POST /api/query`
+Ask a question over the ingested knowledge base. Accepts JSON.
 
-## Constraints Compliance
+**Request:** `{ "query": "What are the key risks?", "top_k": 5 }`
 
-- Uses FastAPI (required)
-- Uses Mistral API for embeddings and generation (required)
-- Implements retrieval logic directly without external RAG/search frameworks
-- Uses an in-process vector store (no third-party vector DB)
+**Response:**
+```json
+{
+  "answer": "The key risks include... [Source: report.pdf, p.4]",
+  "intent": "KB_SEARCH",
+  "search_triggered": true,
+  "query_used": "key risks identified in the report",
+  "citations": [
+    { "source": "report.pdf", "page": 4, "score": 0.631, "text_snippet": "..." }
+  ]
+}
+```
 
-## Known Limitations
+---
 
-- Current storage/index approach is single-process and memory-bound
-- BM25 is rebuilt across full corpus on each ingestion
-- Embedding calls are synchronous within request flow
-- CORS is permissive for local development (`*`)
+## Libraries Used
 
-These are intentional tradeoffs for a simple, interview-friendly implementation.
+| Library | Purpose | Link |
+|---|---|---|
+| FastAPI | API framework | https://fastapi.tiangolo.com |
+| Uvicorn | ASGI server | https://www.uvicorn.org |
+| Mistral AI SDK | Embeddings + chat completions | https://docs.mistral.ai |
+| pdfplumber | PDF text extraction | https://github.com/jsvine/pdfplumber |
+| NumPy | Vector math (cosine similarity, storage) | https://numpy.org |
+| Pydantic / pydantic-settings | Data validation + config | https://docs.pydantic.dev |
+
+---
+
+## Design Decisions
+
+Full rationale for all decisions: chunking strategy, BM25 from scratch, RRF fusion, threshold gating, hallucination filter, security, and scalability notes is documented in [`DECISIONS.txt`](DECISIONS.txt).
