@@ -95,6 +95,17 @@
       font-weight: 600;
     }
     #upload-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    #reset-btn {
+      background: transparent;
+      color: #e74c3c;
+      border: 1px solid #e74c3c;
+      border-radius: 6px;
+      padding: 9px;
+      cursor: pointer;
+      font-size: 0.85rem;
+      font-weight: 600;
+    }
+    #reset-btn:hover { background: #fdf0ef; }
     #file-list { font-size: 0.78rem; color: #444; flex: 1; overflow-y: auto; }
     #file-list li { padding: 3px 0; list-style: none; border-bottom: 1px solid #f0f0f0; }
     #upload-status { font-size: 0.78rem; color: #4f6ef7; min-height: 18px; }
@@ -214,6 +225,7 @@
       <input type="file" id="file-input" accept=".pdf" multiple />
     </div>
     <button id="upload-btn" disabled>Upload</button>
+    <button id="reset-btn">Clear knowledge base</button>
     <span id="upload-status"></span>
     <h2>Ingested Files</h2>
     <ul id="file-list"></ul>
@@ -324,6 +336,20 @@ uploadBtn.addEventListener('click', async () => {
     uploadStatus.textContent = `Error: ${e.message}`;
   } finally {
     uploadBtn.disabled = false;
+  }
+});
+
+// ---- reset store ----
+document.getElementById('reset-btn').addEventListener('click', async () => {
+  if (!confirm('Clear all ingested documents? This cannot be undone.')) return;
+  try {
+    const r = await fetch(`${API}/api/store`, { method: 'DELETE', headers: authHeaders() });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || r.statusText);
+    uploadStatus.textContent = 'Knowledge base cleared.';
+    refreshHealth();
+  } catch (e) {
+    uploadStatus.textContent = `Error: ${e.message}`;
   }
 });
 

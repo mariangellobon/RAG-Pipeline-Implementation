@@ -1,20 +1,20 @@
 """
 PDF text extraction and chunking.
 
-Chunking considerations:
-- Fixed-size token-approximate chunks (char-based) with overlap to preserve context
-  across boundaries. Overlap of ~12% of chunk size ensures sentences split at a
-  boundary still appear in a neighboring chunk, reducing retrieval misses.
-- Pages are extracted individually so we can attach page numbers to citations.
-- We strip excessive whitespace and skip pages with very little text (e.g. cover
-  pages, blank pages) to avoid polluting the index with low-signal chunks.
-- Chunk size of 512 chars (~100-130 tokens for English text) is a deliberate
-  trade-off: small enough for precise retrieval, large enough to carry context.
-  Users can tune CHUNK_SIZE and CHUNK_OVERLAP via env vars.
+Chunking strategy — paragraph-aware with sentence-boundary fallback:
+- Pages are split on paragraph breaks (double newlines) first, which preserves
+  the document's natural structure (headings, bullet groups, body paragraphs).
+- Paragraphs that exceed chunk_size are further split at sentence boundaries
+  (. ? !) so chunks never cut mid-sentence.
+- Adjacent paragraphs are merged until adding the next one would exceed
+  chunk_size, keeping related ideas together without hard character cuts.
+- Pages with very little text (covers, dividers) are skipped to avoid
+  polluting the index with low-signal chunks.
+- Chunk size of 512 chars (~100-130 tokens) is tunable via CHUNK_SIZE env var.
 """
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import BinaryIO
 
 import pdfplumber
@@ -30,19 +30,73 @@ class Chunk:
 
 
 def _clean(text: str) -> str:
-    """Normalise whitespace without collapsing intentional line breaks."""
+    """Normalise whitespace without collapsing intentional paragraph breaks."""
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"[ \t]+", " ", text)
     return text.strip()
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split text into sentences on . ? ! boundaries."""
+    parts = re.split(r'(?<=[.?!])\s+', text.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _chunks_from_paragraphs(text: str, chunk_size: int) -> list[str]:
+    """
+    Split page text into chunks that respect paragraph and sentence boundaries.
+
+    Strategy:
+    1. Split on double-newline paragraph breaks.
+    2. Merge adjacent short paragraphs until adding the next would exceed chunk_size.
+    3. Paragraphs that are themselves longer than chunk_size are split at sentence
+       boundaries using the same greedy merge logic.
+    """
+    paragraphs = [p.strip() for p in re.split(r'\n\n+', text) if p.strip()]
+
+    # Break oversized paragraphs at sentence boundaries
+    units: list[str] = []
+    for para in paragraphs:
+        if len(para) <= chunk_size:
+            units.append(para)
+        else:
+            sentences = _split_sentences(para)
+            current = ""
+            for sent in sentences:
+                if not current:
+                    current = sent
+                elif len(current) + 1 + len(sent) <= chunk_size:
+                    current += " " + sent
+                else:
+                    units.append(current)
+                    current = sent
+            if current:
+                units.append(current)
+
+    # Merge adjacent units greedily up to chunk_size
+    result: list[str] = []
+    current = ""
+    for unit in units:
+        if not current:
+            current = unit
+        elif len(current) + 2 + len(unit) <= chunk_size:
+            current += "\n\n" + unit
+        else:
+            result.append(current)
+            current = unit
+    if current:
+        result.append(current)
+
+    return result
 
 
 def extract_chunks(
     file: BinaryIO,
     filename: str,
     chunk_size: int = 512,
-    chunk_overlap: int = 64,
+    chunk_overlap: int = 64,  # kept for API compatibility, not used in paragraph mode
 ) -> list[Chunk]:
-    """Extract text from a PDF and split it into overlapping chunks."""
+    """Extract text from a PDF and split into paragraph-aware chunks."""
     chunks: list[Chunk] = []
     global_index = 0
 
@@ -55,26 +109,17 @@ def extract_chunks(
             if len(text) < 80:
                 continue
 
-            start = 0
-            while start < len(text):
-                end = start + chunk_size
-                chunk_text = text[start:end].strip()
-
-                if len(chunk_text) >= 40:   # ignore tiny trailing fragments
+            for chunk_text in _chunks_from_paragraphs(text, chunk_size):
+                if len(chunk_text) >= 40:   # ignore tiny fragments
                     chunks.append(
                         Chunk(
                             text=chunk_text,
                             source=filename,
                             page=page_num,
                             chunk_index=global_index,
-                            char_start=start,
+                            char_start=text.find(chunk_text),
                         )
                     )
                     global_index += 1
-
-                # Advance by (chunk_size - overlap) so the next chunk
-                # re-reads the last `overlap` chars of this one.
-                step = chunk_size - chunk_overlap
-                start += step
 
     return chunks

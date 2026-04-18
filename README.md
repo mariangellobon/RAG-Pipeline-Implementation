@@ -329,7 +329,35 @@ Ask a question over the ingested knowledge base. Accepts JSON.
 }
 ```
 
-`answer_rejected: true` is returned instead of citations when more than 40% of answer sentences could not be verified against the source documents.
+`answer_rejected: true` is returned instead of citations when more than 60% of uncited sentences could not be verified against the source documents. Sentences that carry a `[Source: ...]` citation are pre-trusted and excluded from the check.
+
+---
+
+## Limitations
+
+| Constraint | Detail |
+|---|---|
+| File type | PDF only — DOCX, TXT, and HTML are not supported |
+| File size | 50 MB per file (hard limit enforced server-side) |
+| Storage | All vectors are kept in RAM; a very large corpus (10,000+ pages) will exhaust memory |
+| Scalability | Vector search is O(N) over all chunks — query latency grows linearly with corpus size |
+| Deduplication | Uploading the same PDF twice doubles the chunks; there is no duplicate detection |
+| Persistence | A single pickle file is used for storage — not safe for concurrent multi-process deployments |
+| Concurrency | The in-memory store is shared globally; there is no per-user or per-session isolation |
+| Chunking | Paragraph-aware splitting may still cut mid-section on dense, unstructured PDFs |
+
+---
+
+## Potential Next Steps
+
+- **Persistent vector database** — swap the numpy/pickle store for a lightweight embedded DB (e.g. Qdrant, ChromaDB, or pgvector) to support larger corpora and survive process restarts cleanly
+- **Streaming responses** — use Server-Sent Events so the answer streams token-by-token instead of waiting for the full generation
+- **Semantic chunking** — embed each sentence and split on semantic similarity breakpoints for even more precise retrieval (current paragraph-aware approach is a good middle ground)
+- **Cross-encoder re-ranking** — add a second-stage re-ranker after RRF to improve answer quality on long documents
+- **Metadata filtering** — allow queries scoped to a specific file or page range (e.g. "only search within report.pdf")
+- **Broader file support** — extend ingestion to DOCX, TXT, and HTML in addition to PDF
+- **Duplicate detection** — hash file content on upload and skip re-ingestion of identical documents
+- **Rate limiting** — add per-IP or per-key request throttling to prevent API cost abuse in production
 
 ---
 

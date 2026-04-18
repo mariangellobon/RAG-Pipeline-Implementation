@@ -32,6 +32,10 @@ class QueryResponse(BaseModel):
     consistency_warnings: list[str]     # contradictions found across two generations (layer 3)
 
 
+class ResetResponse(BaseModel):
+    message: str
+
+
 class HealthResponse(BaseModel):
     status: str
     chunks_in_store: int

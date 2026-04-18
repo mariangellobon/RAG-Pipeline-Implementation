@@ -40,8 +40,8 @@ def reset_store():
 
 @pytest.fixture
 def client():
-    """Unauthenticated test client (auth disabled — no RAG_API_KEY in env)."""
-    os.environ.pop("RAG_API_KEY", None)
+    """Unauthenticated test client (auth disabled — RAG_API_KEY set to empty string)."""
+    os.environ["RAG_API_KEY"] = ""   # empty string beats .env file value; auth disabled
     get_settings.cache_clear()
     from fastapi.testclient import TestClient
     with TestClient(app) as c:

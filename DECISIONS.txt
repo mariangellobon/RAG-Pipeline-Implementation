@@ -13,33 +13,26 @@ Library choice: pdfplumber
   library, not a RAG framework, so it does not violate the "no external
   search/RAG library" constraint.
 
-Chunking strategy: fixed-size character windows with overlap
-  We split each page's text into chunks of CHUNK_SIZE characters
-  (default 512), advancing by (CHUNK_SIZE - CHUNK_OVERLAP) characters
-  each step (default overlap = 64 chars, ~12% of chunk size).
+Chunking strategy: paragraph-aware with sentence-boundary fallback
+  Pages are split on double-newline paragraph breaks first, preserving
+  the document's natural structure (headings, bullet groups, body
+  paragraphs). Adjacent short paragraphs are merged greedily until
+  adding the next would exceed CHUNK_SIZE. Paragraphs that exceed
+  CHUNK_SIZE are further split at sentence boundaries (. ? !) so chunks
+  never cut mid-sentence.
 
-  Why fixed-size over sentence/paragraph splitting?
-  - Sentence splitters (e.g. spaCy, NLTK) add dependencies and
-    fail silently on noisy PDF text (missing punctuation, ligature
-    artefacts, mid-word line breaks from PDF rendering).
-  - Fixed windows are deterministic and require zero extra libraries.
-  - 512 characters maps to roughly 100–130 tokens for typical English
-    prose, which sits comfortably within Mistral's embedding context
-    window and is small enough to give precise retrieval hits without
-    being so small that individual chunks lose meaning.
+  Why paragraph-aware over fixed-size windows?
+  - Fixed character windows cut mid-sentence, which degrades both
+    retrieval precision (a partial sentence is a poor embedding target)
+    and answer quality (the LLM sees incomplete thoughts).
+  - Paragraph splitting requires no external NLP libraries — pdfplumber
+    preserves newlines, so double-newline splits are zero-dependency.
+  - Sentence-boundary fallback handles dense, unstructured PDFs where
+    paragraph breaks are absent or inconsistent.
 
-Why overlap?
-  A sentence or concept that falls exactly at a chunk boundary would be
-  split in two: the first chunk would have the beginning, the second
-  would have the end, and neither alone would be a good retrieval hit
-  for a question about that concept. By re-reading the last 64 chars of
-  each chunk in the next one, we ensure that boundary-straddling content
-  appears intact in at least one chunk.
-
-  Overlap of 64 chars (12%) is a deliberate trade-off:
-  - Too small (< 5%): boundary misses are frequent.
-  - Too large (> 25%): storage and embedding cost grows, and
-    near-duplicate chunks pollute search results.
+  CHUNK_OVERLAP is retained in the function signature for API
+  compatibility but is not used in paragraph mode — natural paragraph
+  boundaries already prevent mid-concept cuts without artificial overlap.
 
 Minimum chunk length filter (< 40 chars are discarded)
   PDF pages often end with a few stray words or a page number. Chunks

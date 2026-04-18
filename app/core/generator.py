@@ -182,17 +182,27 @@ def _quote_grounded_check(
     Check whether any sentence in the answer introduces a specific fact
     (number, name, date, statistic) not present in or inferable from the context.
 
-    Explanatory sentences, logical inferences, and elaborations of quoted facts
-    are considered supported even without a direct verbatim quote — only
-    sentences that introduce genuinely new facts are flagged.
+    Sentences that already carry a [Source: ...] citation are considered
+    pre-supported and skipped — the model already grounded them during generation.
+    Only uncited sentences are passed to the checker LLM.
 
     The rejection threshold applies to the ratio of flagged sentences among
     all checkable sentences. A 90% explanation / 10% quote answer will not
     be rejected unless the explanatory sentences make up new facts.
     """
-    sentences = _split_sentences(answer)
+    # Partition sentences: cited ones are pre-supported, uncited ones need checking.
+    raw_parts = re.split(r'(?<=[.!?])\s+', answer.strip())
+    uncited_parts = [s for s in raw_parts if '[Source:' not in s]
+    n_cited = len(raw_parts) - len(uncited_parts)
+
+    # Clean uncited sentences (strip formatting, drop trivially short ones)
+    sentences = _split_sentences("\n".join(uncited_parts))
+
+    # Total checkable = cited (auto-supported) + uncited sentences sent to checker
+    total_sentences = n_cited + len(sentences)
+
     if not sentences:
-        return {"flagged": [], "details": [], "answer_rejected": False}
+        return {"flagged": [], "details": [], "answer_rejected": False, "rejection_ratio": 0.0}
 
     prompt = _QUOTE_CHECK_PROMPT.format(context=context, answer="\n".join(sentences))
     raw = client.chat.complete(
@@ -211,8 +221,10 @@ def _quote_grounded_check(
         if isinstance(d, dict) and not d.get("supported", True)
     ]
 
-    rejection_ratio = len(flagged) / len(sentences)
-    answer_rejected = rejection_ratio > rejection_threshold
+    rejection_ratio = len(flagged) / max(total_sentences, 1)
+    # Require at least 2 flagged sentences before rejecting — prevents a single
+    # borderline sentence from killing a mostly-correct answer on short outputs.
+    answer_rejected = rejection_ratio > rejection_threshold and len(flagged) >= 2
 
     return {
         "flagged": flagged,

@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from app.api.deps import verify_api_key
 from app.core.config import get_settings
 from app.core.pdf_parser import extract_chunks
-from app.models.schemas import IngestResponse
+from app.models.schemas import IngestResponse, ResetResponse
 from app.state import bm25, store_lock, vector_store
 
 router = APIRouter()
@@ -104,3 +104,22 @@ async def ingest_files(files: list[UploadFile] = File(...)):
         chunks_created=total_chunks,
         filenames=processed_names,
     )
+
+
+@router.delete(
+    "/store",
+    response_model=ResetResponse,
+    dependencies=[Depends(verify_api_key)],
+)
+async def reset_store():
+    """Clear all ingested documents and reset the knowledge base."""
+    import os
+    settings = get_settings()
+
+    async with store_lock:
+        vector_store.clear()
+        bm25.index([])
+        if os.path.exists(settings.vector_store_path):
+            os.remove(settings.vector_store_path)
+
+    return ResetResponse(message="Knowledge base cleared.")
