@@ -185,7 +185,7 @@ The answer then passes through a **three-layer hallucination pipeline**:
 The model reviews each sentence and flags it only if it introduces a NEW specific fact — a number, name, date, statistic, or event — that is absent from the retrieved context and cannot be inferred from it. Explanatory sentences, logical inferences, and elaborations of quoted facts are explicitly not flagged. A 10%-quote / 90%-explanation answer is fine; only fabricated specifics are a problem.
 
 **Layer 2 — Rejection threshold**
-If more than 40% of sentences are flagged, the answer is rejected entirely and a clear rejection message is returned. Failure is explicit — the system never silently serves a partially hallucinated answer.
+If more than 60% of uncited sentences are flagged, the answer is rejected entirely and a clear rejection message is returned. Failure is explicit — the system never silently serves a partially hallucinated answer.
 
 **Layer 3 — Self-consistency check** *(borderline cases only)*
 Triggered only when layer 1 flags something but doesn't reach the rejection threshold. A second independent generation is run at higher temperature (0.5 vs 0.1). If the two answers contradict each other on a factual claim, that contradiction is surfaced as a consistency warning. Two independent draws from the same model disagreeing on a fact is a genuine signal of uncertainty.
@@ -194,7 +194,7 @@ Triggered only when layer 1 flags something but doesn't reach the rejection thre
 |---|---|---|
 | Clean answer | 2 (generate + quote-check) | Answer + citations |
 | Borderline (some flags) | 3 (+ consistency check) | Answer + warnings |
-| Rejected (> 40% flagged) | 2 | Rejection message |
+| Rejected (> 60% flagged) | 2 | Rejection message |
 
 ---
 
@@ -269,7 +269,7 @@ Key variables:
 | `CHUNK_OVERLAP` | `64` | Overlap between chunks |
 | `SIMILARITY_THRESHOLD` | `0.35` | Minimum score to trigger generation |
 | `TOP_K` | `5` | Chunks returned per query |
-| `HALLUCINATION_REJECTION_THRESHOLD` | `0.4` | Fraction of flagged sentences that triggers answer rejection |
+| `HALLUCINATION_REJECTION_THRESHOLD` | `0.6` | Fraction of flagged sentences that triggers answer rejection |
 
 ### 3. Start the server
 
