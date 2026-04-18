@@ -26,7 +26,10 @@ class QueryResponse(BaseModel):
     intent: str
     citations: list[Citation]
     search_triggered: bool
-    query_used: str  # the transformed query (or original if no transform)
+    query_used: str
+    answer_rejected: bool
+    hallucination_warnings: list[str]   # sentences that lack a supporting quote (layer 1)
+    consistency_warnings: list[str]     # contradictions found across two generations (layer 3)
 
 
 class HealthResponse(BaseModel):

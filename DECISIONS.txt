@@ -170,19 +170,68 @@ content typically falls below 0.3; genuine topic matches usually exceed
 
 
 ────────────────────────────────────────────────────────
-7. HALLUCINATION FILTER
+7. HALLUCINATION FILTER (three-layer post-hoc pipeline)
 ────────────────────────────────────────────────────────
 
-After generation, a second Mistral call is made asking the model to
-act as a fact-checker: given the context chunks and the generated
-answer, identify any sentences in the answer that are NOT supported by
-the context. Unsupported sentences are returned as a JSON array and
-appended to the response as a visible warning to the user.
+Why not a multi-agent debate loop (Researcher / Skeptic / Judge)?
+  That pattern is conceptually appealing but has a critical flaw: every
+  "agent" is the same underlying model with a different system prompt.
+  The Skeptic has already read the Researcher's answer and is biased by
+  it. It adds 4–6 LLM calls per query while producing theater, not
+  independent verification. The three-layer approach below achieves
+  genuine verification at 1–2 extra calls.
 
-This is a "post-hoc evidence check" — it does not prevent hallucination
-at generation time but surfaces it transparently so the user can
-evaluate the answer critically. The cost is one additional API call per
-query that triggers generation.
+Layer 1 — Fact-introduction check
+  The model reviews each sentence and flags it only if it introduces a
+  NEW specific fact (number, name, date, statistic, event) that is NOT
+  present in and NOT inferable from the retrieved context.
+
+  Explanatory sentences are explicitly not penalised. A good answer is
+  typically 10-20% direct citation and 80-90% synthesis and explanation.
+  An answer that quotes one key passage and then spends the remaining
+  sentences reasoning through its implications is valid — that is the
+  model adding value, not hallucinating. Only sentences that fabricate
+  new specifics absent from the context are flagged.
+
+  Supersedes verbatim-quote requirement: an earlier design required a
+  word-for-word quote for every sentence, which was too strict. It
+  penalised elaboration and inference — the exact behaviour we want.
+
+  Implementation: sentences are extracted and stripped of citation
+  markers and markdown, then sent with the context. The model returns a
+  JSON array with supported=true/false, an anchor passage for cited
+  claims, and a missing_fact description for unsupported ones.
+
+Layer 2 — Rejection threshold
+  If more than HALLUCINATION_REJECTION_THRESHOLD (default 40%) of
+  checkable sentences are flagged, the answer is rejected entirely.
+  The API returns a clear rejection message instead of serving a
+  partially fabricated answer. Failure is explicit, not silent.
+
+  Because layer 1 now only flags fabricated specifics (not explanatory
+  sentences), 40% is a meaningful bar: reaching it means the answer
+  is substantially inventing facts, not just explaining them.
+
+Layer 3 — Self-consistency check (borderline cases only)
+  Triggered only when 1+ sentences are flagged but the rejection
+  threshold is not exceeded. A second independent generation is run at
+  temperature=0.5 (vs 0.1 for the primary answer). The two answers are
+  then compared by the model for factual contradictions.
+
+  Why this adds value: if the same model, given the same context,
+  produces different factual claims across two independent draws, that
+  divergence is a genuine signal of uncertainty or hallucination — not
+  just paraphrasing. Contradictions are surfaced as consistency warnings
+  in the response.
+
+  This layer is deliberately not run on every query — only when layer 1
+  already found something suspicious — to avoid paying for it on clean
+  answers.
+
+API costs per query:
+  Clean answer (no flags):        1 generation + 1 quote-check = 2 calls
+  Borderline (some flags):        1 generation + 1 quote-check + 1 consistency = 3 calls
+  Rejected (> threshold):         1 generation + 1 quote-check = 2 calls (no consistency needed)
 
 
 ────────────────────────────────────────────────────────

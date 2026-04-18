@@ -3,7 +3,7 @@ Thin wrapper around Mistral's embedding endpoint.
 Kept separate so it can be swapped for a local model without touching other modules.
 """
 
-from mistralai import Mistral
+from mistralai.client import Mistral
 
 from app.core.config import get_settings
 

@@ -1,7 +1,8 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api import ingest, query
@@ -29,15 +30,31 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+settings = get_settings()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 app.include_router(ingest.router, prefix="/api", tags=["ingestion"])
 app.include_router(query.router, prefix="/api", tags=["querying"])
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """Return JSON for any unhandled exception so the UI never gets a plain-text 500."""
+    msg = str(exc)
+    if "401" in msg or "Unauthorized" in msg:
+        return JSONResponse(
+            status_code=502,
+            content={"detail": "Mistral API key is invalid or expired. Check MISTRAL_API_KEY in your .env file."},
+        )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal server error: {msg}"},
+    )
 
 @app.get("/health", response_model=HealthResponse, tags=["health"])
 def health():

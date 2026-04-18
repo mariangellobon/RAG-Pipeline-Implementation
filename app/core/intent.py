@@ -11,7 +11,7 @@ Query transformation rewrites the user's raw question into a retrieval-
 optimised form (more noun-heavy, removes filler words, expands abbreviations).
 """
 
-from mistralai import Mistral
+from mistralai.client import Mistral
 
 from app.core.config import get_settings
 

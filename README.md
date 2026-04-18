@@ -27,7 +27,7 @@ Both endpoints use `POST` because both receive data from the client in the reque
 │                            FastAPI Backend                           │
 │                                                                      │
 │  ┌─────────────────────┐           ┌──────────────────────────────┐  │
-│  │  Ingestion Pipeline │           │       Query Pipeline          │  │
+│  │  Ingestion Pipeline │           │       Query Pipeline         │  │
 │  │                     │           │                              │  │
 │  │  Extract → Chunk    │  [1] WRITE│  Intent Detection            │  │
 │  │          ↓          │ ─────────►│       ↓                      │  │
@@ -38,13 +38,13 @@ Both endpoints use `POST` because both receive data from the client in the reque
 │  │   + BM25 index      │           │       ↓                      │  │
 │  └─────────────────────┘           │  [3] READ from Storage       │  │
 │                                    │  Semantic + BM25 search      │  │
-│  ┌─────────────────────┐  [3] READ │       ↓                      │  │
+│  ┌──────────────────────┐ [3] READ │       ↓                      │  │
 │  │    Storage Layer     │◄─────────│  RRF Re-rank                 │  │
 │  │                      │          │       ↓                      │  │
 │  │  VectorStore (numpy) │          │  Threshold Gate              │  │
 │  │  BM25 Index          │          │       ↓                      │  │
 │  │  Pickle on disk      │          │  [4] Generate answer         │  │
-│  └─────────────────────┘          │  (Mistral chat)              │  │
+│  └──────────────────────┘          │  (Mistral chat)              │  │
 │                                    │       ↓                      │  │
 │                                    │  Hallucination check         │  │
 │                                    └──────────────────────────────┘  │
@@ -101,37 +101,37 @@ User Query
     │              Intent routing              │
     │                                          │
   GREETING /           REFUSAL            KB_SEARCH
-  CONVERSATIONAL          │                   │
-    │                     ▼                   ▼
+  CONVERSATIONAL          │                    │
+    │                     ▼                    ▼
     │              Return policy        Query Transform
     │              message              (rewrite for retrieval)
-    │                                        │
-    ▼                                        ▼
-Direct LLM                          Embed transformed query
-response                                    │
-    │                          ┌────────────┼────────────┐
-    │                          ▼                         ▼
-    │                  Semantic Search             BM25 Search
-    │                  (cosine similarity)         (keyword match)
-    │                          │                         │
-    │                          └────────────┬────────────┘
-    │                                       ▼
-    │                              RRF Fusion & Re-rank
-    │                                       │
-    │                              Similarity Threshold
-    │                               (score ≥ 0.35?)
-    │                              /                \
-    │                            YES                NO
-    │                             │                  │
-    │                             ▼                  ▼
-    │                       LLM Generation    "Insufficient
-    │                             │             evidence"
-    │                             ▼
-    │                    Hallucination Check
-    │                             │
-    └─────────────────────────────┤
-                                  ▼
-                       Response + Citations
+    │                                          │
+    ▼                                          ▼
+Direct LLM                           Embed transformed query
+response                                       │
+    │                             ┌────────────┼────────────┐
+    │                             ▼                         ▼
+    │                      Semantic Search             BM25 Search
+    │                    (cosine similarity)         (keyword match)
+    │                             │                         │
+    │                             └────────────┬────────────┘
+    │                                          ▼
+    │                                 RRF Fusion & Re-rank
+    │                                          │
+    │                                 Similarity Threshold
+    │                                  (score ≥ 0.35?)
+    │                                 /                \
+    │                               YES                NO
+    │                                │                  │
+    │                                ▼                  ▼
+    │                          LLM Generation    "Insufficient
+    │                                │             evidence"
+    │                                ▼
+    │                       Hallucination Check
+    │                                │
+    └────────────────────────────────┤
+                                     ▼
+                            Response + Citations
 ```
 
 ---
@@ -179,7 +179,22 @@ RRF is rank-based, so it avoids the scale mismatch between cosine scores (bounde
 
 Retrieved chunks are assembled into a context block with source labels. A Mistral chat completion call produces a factual answer with inline citations (`[Source: filename, p.N]`).
 
-A second post-hoc LLM call acts as a hallucination filter: it checks each sentence in the answer against the context chunks and surfaces any claims not supported by the retrieved evidence.
+The answer then passes through a **three-layer hallucination pipeline**:
+
+**Layer 1 — Fact-introduction check**
+The model reviews each sentence and flags it only if it introduces a NEW specific fact — a number, name, date, statistic, or event — that is absent from the retrieved context and cannot be inferred from it. Explanatory sentences, logical inferences, and elaborations of quoted facts are explicitly not flagged. A 10%-quote / 90%-explanation answer is fine; only fabricated specifics are a problem.
+
+**Layer 2 — Rejection threshold**
+If more than 40% of sentences are flagged, the answer is rejected entirely and a clear rejection message is returned. Failure is explicit — the system never silently serves a partially hallucinated answer.
+
+**Layer 3 — Self-consistency check** *(borderline cases only)*
+Triggered only when layer 1 flags something but doesn't reach the rejection threshold. A second independent generation is run at higher temperature (0.5 vs 0.1). If the two answers contradict each other on a factual claim, that contradiction is surfaced as a consistency warning. Two independent draws from the same model disagreeing on a fact is a genuine signal of uncertainty.
+
+| Scenario | LLM calls | Outcome |
+|---|---|---|
+| Clean answer | 2 (generate + quote-check) | Answer + citations |
+| Borderline (some flags) | 3 (+ consistency check) | Answer + warnings |
+| Rejected (> 40% flagged) | 2 | Rejection message |
 
 ---
 
@@ -188,11 +203,12 @@ A second post-hoc LLM call acts as a hallucination filter: it checks each senten
 ```
 rag-pipeline/
 ├── app/
-│   ├── main.py               FastAPI app, lifespan (load/save store), health endpoint
-│   ├── state.py              Shared singletons: VectorStore + BM25
+│   ├── main.py               FastAPI app, CORS, lifespan (load/save store)
+│   ├── state.py              Shared singletons: VectorStore, BM25, asyncio.Lock
 │   ├── api/
-│   │   ├── ingest.py         POST /api/ingest
-│   │   └── query.py          POST /api/query
+│   │   ├── deps.py           Auth dependency (X-API-Key header check)
+│   │   ├── ingest.py         POST /api/ingest  (auth-protected)
+│   │   └── query.py          POST /api/query   (auth-protected)
 │   ├── core/
 │   │   ├── pdf_parser.py     pdfplumber extraction + overlapping chunker
 │   │   ├── vector_store.py   numpy vector store, cosine similarity, pickle persistence
@@ -204,6 +220,16 @@ rag-pipeline/
 │   │   └── config.py         Settings from .env (Pydantic)
 │   └── models/
 │       └── schemas.py        Pydantic request/response models
+├── tests/
+│   ├── conftest.py           Fixtures: test clients, store reset, settings override
+│   ├── test_auth.py          Auth: missing key, wrong key, disabled auth
+│   ├── test_ingest.py        Ingest: validation, happy path, empty PDF
+│   ├── test_query.py         Query: intents, citations, rejection, consistency warnings
+│   └── core/
+│       ├── test_bm25.py      BM25 scoring and tokenisation
+│       ├── test_vector_store.py  Cosine similarity, top-k, zero-vector edge case
+│       ├── test_retriever.py RRF fusion, threshold gate
+│       └── test_pdf_parser.py   Chunking overlap, fragment filtering
 ├── ui/
 │   └── index.html            Chat UI (file upload + Q&A)
 ├── DECISIONS.txt             Full design rationale and chunking considerations
@@ -237,10 +263,13 @@ Key variables:
 | `MISTRAL_API_KEY` | — | Required |
 | `MISTRAL_EMBED_MODEL` | `mistral-embed` | Embedding model |
 | `MISTRAL_CHAT_MODEL` | `mistral-small-latest` | Chat model |
+| `RAG_API_KEY` | unset | Protects `/api/ingest` and `/api/query`. Leave unset to disable auth in dev |
+| `ALLOWED_ORIGINS` | `*` | CORS — comma-separated origins, e.g. `http://localhost:3000` |
 | `CHUNK_SIZE` | `512` | Characters per chunk |
 | `CHUNK_OVERLAP` | `64` | Overlap between chunks |
 | `SIMILARITY_THRESHOLD` | `0.35` | Minimum score to trigger generation |
 | `TOP_K` | `5` | Chunks returned per query |
+| `HALLUCINATION_REJECTION_THRESHOLD` | `0.4` | Fraction of flagged sentences that triggers answer rejection |
 
 ### 3. Start the server
 
@@ -252,7 +281,13 @@ uvicorn app.main:app --reload
 |---|---|
 | `http://localhost:8000/` | Chat UI |
 | `http://localhost:8000/docs` | Interactive API docs (Swagger) |
-| `http://localhost:8000/health` | Store status |
+| `http://localhost:8000/health` | Store status (public) |
+
+### 4. Run tests
+
+```bash
+pytest tests/ -v
+```
 
 ---
 
@@ -276,6 +311,8 @@ Ask a question over the ingested knowledge base. Accepts JSON.
 
 **Request:** `{ "query": "What are the key risks?", "top_k": 5 }`
 
+**Headers:** `X-API-Key: <your RAG_API_KEY>` (required when `RAG_API_KEY` is set in `.env`)
+
 **Response:**
 ```json
 {
@@ -283,11 +320,16 @@ Ask a question over the ingested knowledge base. Accepts JSON.
   "intent": "KB_SEARCH",
   "search_triggered": true,
   "query_used": "key risks identified in the report",
+  "answer_rejected": false,
   "citations": [
     { "source": "report.pdf", "page": 4, "score": 0.631, "text_snippet": "..." }
-  ]
+  ],
+  "hallucination_warnings": [],
+  "consistency_warnings": []
 }
 ```
+
+`answer_rejected: true` is returned instead of citations when more than 40% of answer sentences could not be verified against the source documents.
 
 ---
 
