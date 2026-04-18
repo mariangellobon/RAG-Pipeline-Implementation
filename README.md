@@ -377,30 +377,3 @@ Ask a question over the ingested knowledge base. Accepts JSON.
 ## Design Decisions
 
 Full rationale for all decisions: chunking strategy, BM25 from scratch, RRF fusion, threshold gating, hallucination filter, security, and scalability notes is documented in [`DECISIONS.txt`](DECISIONS.txt).
-
----                                                              
-## Limitations                                                 
-                                                                 
-| Constraint | Detail |                                        
-|---|---|                                                        
-| File type | PDF only — DOCX, TXT, and HTML are not supported |
-| File size | 50 MB per file (hard limit enforced server-side) | 
-| Storage | All vectors are kept in RAM; a very large corpus (10,000+ pages) will exhaust memory |                            
-| Scalability | Vector search is O(N) over all chunks — query latency grows linearly with corpus size |                        
-| Deduplication | Uploading the same PDF twice doubles the chunks; there is no duplicate detection |                      
-| Persistence | A single pickle file is used for storage — not safe for concurrent multi-process deployments |                
-| Concurrency | The in-memory store is shared globally; there is no per-user or per-session isolation |                          
-| Chunking | Fixed character windows may split mid-sentence; no semantic boundary detection |                                  
-                                                                 
----                                                            
-                                                                 
-## Potential Next Steps                                        
-                                                                 
-- **Persistent vector database** — swap the numpy/pickle store for a lightweight embedded DB (e.g. Qdrant, ChromaDB, or pgvector) to support larger corpora and survive process restarts cleanly                                                          
-- **Streaming responses** — use Server-Sent Events so the answer streams token-by-token instead of waiting for the full generation
-- **Semantic chunking** — split on sentence or paragraph boundaries instead of fixed character windows to preserve context and improve retrieval precision                                 
-- **Cross-encoder re-ranking** — add a second-stage re-ranker after RRF to improve answer quality on long documents            
-- **Metadata filtering** — allow queries scoped to a specific file or page range (e.g. "only search within report.pdf")    
-- **Broader file support** — extend ingestion to DOCX, TXT, and HTML in addition to PDF                                        
-- **Duplicate detection** — hash file content on upload and skip re-ingestion of identical documents                             
-- **Rate limiting** — add per-IP or per-key request throttling to prevent API cost abuse in production 
